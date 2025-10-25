@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -49,6 +50,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   StreamSubscription<List<ScanResult>>? _scanSub;
+  StreamSubscription<Position>? _posSub;
   BluetoothDevice? _connectedDevice;
   BluetoothCharacteristic? _rxChar;
   BluetoothCharacteristic? _txChar;
@@ -60,6 +62,10 @@ class _HomePageState extends State<HomePage> {
   // Environment variables
   String _googleApiKey = '';
   String _routeApiUrl = '';
+
+  // Route navigation state
+  List<Map<String, dynamic>> _waypoints = [];
+  int _currentWaypointIdx = 0;
 
   static const String _nusbService = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
   static const String _nusbTx = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
@@ -94,6 +100,7 @@ class _HomePageState extends State<HomePage> {
   @override
   void dispose() {
     _scanSub?.cancel();
+    _posSub?.cancel();
     _destinationCtrl.dispose();
     _connectedDevice?.disconnect();
     super.dispose();
@@ -214,6 +221,131 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
+  double _haversineDistance(
+      double lat1, double lon1, double lat2, double lon2) {
+    const R = 6371000.0; // Earth radius in meters
+    final lat1Rad = lat1 * math.pi / 180.0;
+    final lat2Rad = lat2 * math.pi / 180.0;
+    final dLat = (lat2 - lat1) * math.pi / 180.0;
+    final dLon = (lon2 - lon1) * math.pi / 180.0;
+    final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+        math.cos(lat1Rad) *
+            math.cos(lat2Rad) *
+            math.sin(dLon / 2) *
+            math.sin(dLon / 2);
+    final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+    return R * c;
+  }
+
+  double _bearingDegrees(double lat1, double lon1, double lat2, double lon2) {
+    final lat1Rad = lat1 * math.pi / 180.0;
+    final lat2Rad = lat2 * math.pi / 180.0;
+    final dLon = (lon2 - lon1) * math.pi / 180.0;
+    final x = math.sin(dLon) * math.cos(lat2Rad);
+    final y = math.cos(lat1Rad) * math.sin(lat2Rad) -
+        math.sin(lat1Rad) * math.cos(lat2Rad) * math.cos(dLon);
+    final brng = math.atan2(x, y) * 180.0 / math.pi;
+    return (brng + 360) % 360;
+  }
+
+  String _classifyTurn(Map<String, dynamic> prev, Map<String, dynamic> curr,
+      Map<String, dynamic> next) {
+    try {
+      final inB =
+          _bearingDegrees(prev['lat'], prev['lng'], curr['lat'], curr['lng']);
+      final outB =
+          _bearingDegrees(curr['lat'], curr['lng'], next['lat'], next['lng']);
+      double diff = (outB - inB + 540) % 360 - 180;
+      if (diff.abs() <= 15) return 'STRAIGHT';
+      return diff > 0 ? 'RIGHT' : 'LEFT';
+    } catch (_) {
+      return 'STRAIGHT';
+    }
+  }
+
+  String _extractStreet(String? desc) {
+    if (desc == null || desc.isEmpty) return 'Unknown';
+    final d = desc.toLowerCase();
+    if (d.contains(' on ')) {
+      final parts = d.split(' on ');
+      if (parts.length > 1) return parts[1].split(' ')[0];
+    }
+    if (d.contains(' onto ')) {
+      final parts = d.split(' onto ');
+      if (parts.length > 1) return parts[1].split(' ')[0];
+    }
+    final words = desc.split(' ');
+    return words.length > 1 ? '${words[0]} ${words[1]}' : words[0];
+  }
+
+  Future<void> _startLocationStreaming() async {
+    // cancel any previous stream
+    await _posSub?.cancel();
+    const locSettings = LocationSettings(
+      accuracy: LocationAccuracy.high,
+      distanceFilter: 1, // meters - update every meter
+      timeLimit: Duration(seconds: 1), // force update every second
+    );
+    _posSub = Geolocator.getPositionStream(locationSettings: locSettings)
+        .listen((pos) async {
+      if (_connectedDevice == null || _rxChar == null) return;
+
+      // Advance through waypoints within 20m
+      while (_currentWaypointIdx < _waypoints.length) {
+        final wp = _waypoints[_currentWaypointIdx];
+        final d = _haversineDistance(
+            pos.latitude, pos.longitude, wp['lat'], wp['lng']);
+        if (d <= 20) {
+          _currentWaypointIdx++;
+        } else {
+          break;
+        }
+      }
+
+      // Reached destination
+      if (_currentWaypointIdx >= _waypoints.length) {
+        try {
+          final msg = 'NAV:DESTINATION|0m|ARRIVED|REACHED\n';
+          await _rxChar!.write(utf8.encode(msg), withoutResponse: false);
+          setState(() => _status = 'Destination reached!');
+        } catch (_) {}
+        return;
+      }
+
+      // Compute navigation message
+      final curr = _waypoints[_currentWaypointIdx];
+      final dist = _haversineDistance(
+          pos.latitude, pos.longitude, curr['lat'], curr['lng']);
+      final distText = dist > 1000
+          ? '${(dist / 1000).toStringAsFixed(1)}km'
+          : '${dist.toInt()}m';
+
+      String currentStreet = _currentWaypointIdx > 0
+          ? _extractStreet(_waypoints[_currentWaypointIdx - 1]['description'])
+          : 'Start';
+      String nextStreet = _extractStreet(curr['description']);
+      String turnLabel = 'STRAIGHT';
+
+      if (_currentWaypointIdx > 0 &&
+          _currentWaypointIdx < _waypoints.length - 1) {
+        turnLabel = _classifyTurn(
+          _waypoints[_currentWaypointIdx - 1],
+          curr,
+          _waypoints[_currentWaypointIdx + 1],
+        );
+      }
+
+      // Send: NAV:currentStreet|dist|turn|nextStreet
+      final navMsg = 'NAV:$currentStreet|$distText|$turnLabel|$nextStreet\n';
+      try {
+        await _rxChar!.write(utf8.encode(navMsg), withoutResponse: false);
+        setState(() => _status = 'ON $currentStreet | IN $distText $turnLabel');
+      } catch (e) {
+        // occasional failure OK
+      }
+    });
+  }
+
   Future<Position> _getCurrentLocation() async {
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
@@ -296,73 +428,29 @@ class _HomePageState extends State<HomePage> {
     final firstRoute = routes[0];
     final points = firstRoute['points'] as List<dynamic>;
 
-    // Update UI to display route
+    // Store waypoints for local navigation processing
     setState(() {
+      _waypoints = points
+          .map((p) => {
+                'lat': p['lat'] as double,
+                'lng': p['lng'] as double,
+                'description': p['description'] ?? '',
+              })
+          .toList();
+      _currentWaypointIdx = 0;
       _routePoints = points.map((p) {
         final lat = p['lat'];
         final lng = p['lng'];
         final desc = p['description'] ?? '';
         return '$lat, $lng ${desc.isNotEmpty ? "- $desc" : ""}';
       }).toList();
+      _status =
+          'Route loaded: ${_waypoints.length} waypoints. Starting live navigation...';
     });
 
-    // Send route to Pico as JSON
-    setState(() => _status = 'Sending ${points.length} waypoints to Pico...');
-
-    // Format the data as JSON matching Pico's expected structure
-    final jsonData = json.encode({
-      'routes': [
-        {
-          'points': points
-              .map((p) => {
-                    'lat': p['lat'],
-                    'lng': p['lng'],
-                    'description': p['description'] ?? '',
-                    'is_down_hill': false,
-                  })
-              .toList()
-        }
-      ]
-    });
-
-    final payload = utf8.encode(jsonData);
-    print('📤 Total JSON payload size: ${payload.length} bytes');
-
-    try {
-      // Use smaller chunk size to match actual BLE transfer capacity
-      const chunkSize = 20; // Match the observed chunk size from Pico
-      int totalChunks = (payload.length / chunkSize).ceil();
-
-      setState(() => _status = 'Sending ${totalChunks} chunks to Pico...');
-
-      for (var offset = 0; offset < payload.length; offset += chunkSize) {
-        final end = (offset + chunkSize < payload.length)
-            ? offset + chunkSize
-            : payload.length;
-        final chunk = payload.sublist(offset, end);
-
-        int chunkNumber = (offset / chunkSize).floor() + 1;
-        print(
-            '📤 Sending chunk $chunkNumber/$totalChunks (${chunk.length} bytes)');
-
-        // Use withoutResponse: false because Pico UART requires write with response
-        await _rxChar!.write(chunk, withoutResponse: false);
-
-        // Update status with progress
-        setState(() => _status = 'Sending chunk $chunkNumber/$totalChunks...');
-
-        // Longer delay between chunks to ensure Pico can process
-        await Future.delayed(const Duration(milliseconds: 150));
-      }
-
-      setState(() => _status =
-          'Route sent! ${points.length} waypoints in ${totalChunks} chunks.');
-
-      print('✅ All chunks sent successfully');
-    } catch (e) {
-      setState(() => _status = 'Send failed: $e');
-      print('❌ Send error: $e');
-    }
+    // Begin streaming live location and computing nav updates locally
+    await _startLocationStreaming();
+    print('✅ Route loaded and navigation started');
   }
 
   Widget _buildConnectionCard() {
@@ -391,6 +479,7 @@ class _HomePageState extends State<HomePage> {
                           _status = 'Disconnected';
                           _routePoints = [];
                         });
+                        await _posSub?.cancel();
                       }
                     : null,
                 child: const Text('Disconnect'),
