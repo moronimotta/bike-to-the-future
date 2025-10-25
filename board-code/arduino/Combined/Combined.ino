@@ -2,16 +2,13 @@ const int ldrPin = A0;      // LDR input
 const int ledTransistor = 7; // Base resistor connected here
 const int threshold = 100;   // Adjust this depending on your LDR readings
 
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7735.h>
-#include <SPI.h>
+#include <LiquidCrystal_I2C.h>
 
-// TFT pins
-#define TFT_CS     10
-#define TFT_DC     8
-#define TFT_RST    9
+// LC pins
+#define LC_SDA 11
+#define LC_SCL 13
 
-Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+LiquidCrystal_I2C lcd(0x27, 16, 2);
 
 // Reed switch pin
 const int reedPin = 2;
@@ -40,18 +37,11 @@ void setup() {
   pinMode(reedPin, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(reedPin), reedTriggered, FALLING);
 
-  // Initialize TFT
-  tft.initR(INITR_BLACKTAB);
-  tft.setRotation(1);
-  tft.fillScreen(ST77XX_BLACK);
-
-  // Initial screen
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setTextSize(2);
-  tft.setCursor(10, 10);
-  tft.println("Bike Speedometer");
-  delay(1500);
-  tft.fillScreen(ST77XX_BLACK);
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Bikes");
+  delay(1000);
 
   pinMode(ledTransistor, OUTPUT);
 }
@@ -103,28 +93,17 @@ void reedTriggered() {
 }
 
 void displayData() {
-  tft.fillScreen(ST77XX_BLACK);
-
+  lcd.clear();
+  
   // Current speed
-  tft.setTextColor(ST77XX_GREEN);
-  tft.setTextSize(3);
-  tft.setCursor(10, 10);
-  tft.print(speed, 1);
-  tft.println(" MPH");
-
-  // Max speed
-  tft.setTextColor(ST77XX_YELLOW);
-  tft.setTextSize(2);
-  tft.setCursor(10, 55);
-  tft.print("Max: ");
-  tft.print(maxSpeed, 1);
-  tft.println(" MPH");
+  lcd.setCursor(0, 0);
+  lcd.print("Speed: ");
+  lcd.print(speed);
+  lcd.print(" MPH");
 
   // Distance
-  tft.setTextColor(ST77XX_CYAN);
-  tft.setTextSize(2);
-  tft.setCursor(10, 80);
-  tft.print("Dist: ");
-  tft.print(distance, 2);
-  tft.println(" mi");
+  lcd.setCursor(0, 1);
+  lcd.print("Dist: ");
+  lcd.print(distance);
+  lcd.print(" mi");
 }
