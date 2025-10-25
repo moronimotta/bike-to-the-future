@@ -268,14 +268,35 @@ class _HomePageState extends State<HomePage> {
     final d = desc.toLowerCase();
     if (d.contains(' on ')) {
       final parts = d.split(' on ');
-      if (parts.length > 1) return parts[1].split(' ')[0];
+      if (parts.length > 1) {
+        // Get full street name (everything after " on " until next common word)
+        String streetPart = parts[1].trim();
+        // Remove common endings like "toward", "for", etc.
+        final stopWords = [' toward', ' for ', ' to ', ' at '];
+        for (var word in stopWords) {
+          if (streetPart.contains(word)) {
+            streetPart = streetPart.split(word)[0];
+          }
+        }
+        return streetPart.trim();
+      }
     }
     if (d.contains(' onto ')) {
       final parts = d.split(' onto ');
-      if (parts.length > 1) return parts[1].split(' ')[0];
+      if (parts.length > 1) {
+        String streetPart = parts[1].trim();
+        final stopWords = [' toward', ' for ', ' to ', ' at '];
+        for (var word in stopWords) {
+          if (streetPart.contains(word)) {
+            streetPart = streetPart.split(word)[0];
+          }
+        }
+        return streetPart.trim();
+      }
     }
+    // Fallback: return first few words
     final words = desc.split(' ');
-    return words.length > 1 ? '${words[0]} ${words[1]}' : words[0];
+    return words.length > 2 ? '${words[0]} ${words[1]} ${words[2]}' : desc;
   }
 
   Future<void> _startLocationStreaming() async {
@@ -283,8 +304,9 @@ class _HomePageState extends State<HomePage> {
     await _posSub?.cancel();
     const locSettings = LocationSettings(
       accuracy: LocationAccuracy.high,
-      distanceFilter: 1, // meters - update every meter
-      timeLimit: Duration(seconds: 1), // force update every second
+      distanceFilter:
+          5, // meters - update every 5 meters (more reliable than 1m)
+      // Remove timeLimit to avoid timeout exceptions
     );
     _posSub = Geolocator.getPositionStream(locationSettings: locSettings)
         .listen((pos) async {
@@ -320,9 +342,6 @@ class _HomePageState extends State<HomePage> {
           ? '${(dist / 1000).toStringAsFixed(1)}km'
           : '${dist.toInt()}m';
 
-      String currentStreet = _currentWaypointIdx > 0
-          ? _extractStreet(_waypoints[_currentWaypointIdx - 1]['description'])
-          : 'Start';
       String nextStreet = _extractStreet(curr['description']);
       String turnLabel = 'STRAIGHT';
 
@@ -335,15 +354,45 @@ class _HomePageState extends State<HomePage> {
         );
       }
 
-      // Send: NAV:currentStreet|dist|turn|nextStreet
-      final navMsg = 'NAV:$currentStreet|$distText|$turnLabel|$nextStreet\n';
-      try {
-        await _rxChar!.write(utf8.encode(navMsg), withoutResponse: false);
-        setState(() => _status = 'ON $currentStreet | IN $distText $turnLabel');
-      } catch (e) {
-        // occasional failure OK
+      // Build full navigation message
+      String instruction;
+      if (turnLabel == 'STRAIGHT') {
+        instruction = 'Go straight on $nextStreet';
+      } else {
+        instruction = 'Turn $turnLabel on $nextStreet';
       }
+
+      final fullMessage = '$instruction|$distText';
+
+      try {
+        // Send in chunks to handle BLE size limits (20 bytes per write)
+        await _sendNavMessage(fullMessage);
+        setState(() => _status = fullMessage);
+      } catch (e) {
+        print('Failed to send nav message: $e');
+      }
+    }, onError: (error) {
+      // Handle location stream errors (like TimeoutException)
+      print('Location stream error: $error');
+      setState(() => _status = 'Location update error (continuing...)');
     });
+  }
+
+  Future<void> _sendNavMessage(String message) async {
+    if (_rxChar == null) return;
+
+    // Send as "NAV:message\n" in chunks of max 20 bytes
+    final fullMsg = 'NAV:$message\n';
+    final bytes = utf8.encode(fullMsg);
+
+    const chunkSize = 20;
+    for (int i = 0; i < bytes.length; i += chunkSize) {
+      final end = (i + chunkSize < bytes.length) ? i + chunkSize : bytes.length;
+      final chunk = bytes.sublist(i, end);
+      await _rxChar!.write(chunk, withoutResponse: false);
+      await Future.delayed(
+          const Duration(milliseconds: 50)); // Small delay between chunks
+    }
   }
 
   Future<Position> _getCurrentLocation() async {

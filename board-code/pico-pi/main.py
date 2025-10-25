@@ -63,6 +63,9 @@ class BLECoordinate:
         ((self._tx_handle, self._rx_handle),) = self._ble.gatts_register_services((_UART_SERVICE,))
         self._connections = set()
         self._led = Pin("LED", Pin.OUT)
+        
+        # Buffer for assembling chunked NAV messages
+        self._nav_buffer = b''
 
         mac = ubinascii.hexlify(self._ble.config("mac")[1], ":").decode().upper()
         self._name = "Pico {}".format(mac)
@@ -90,26 +93,39 @@ class BLECoordinate:
             conn_handle, value_handle = data
             if value_handle == self._rx_handle:
                 incoming = self._ble.gatts_read(self._rx_handle)
-                # Fast path: NAV commands from phone like b"NAV:street|dist|turn|next\n"
-                try:
-                    if incoming.startswith(b'NAV:'):
-                        try:
-                            txt = incoming.decode().strip()
-                            # Parse: NAV:currentStreet|dist|turn|nextStreet
+                
+                # Append to buffer
+                self._nav_buffer += incoming
+                
+                # Check if we have a complete message (ends with \n)
+                if b'\n' in self._nav_buffer:
+                    # Extract complete message
+                    idx = self._nav_buffer.index(b'\n')
+                    complete_msg = self._nav_buffer[:idx]
+                    self._nav_buffer = self._nav_buffer[idx+1:]  # Keep remaining data
+                    
+                    print("DEBUG: Complete message:", complete_msg)
+                    
+                    # Process NAV messages
+                    try:
+                        if complete_msg.startswith(b'NAV:'):
+                            txt = complete_msg.decode().strip()
+                            # Parse: NAV:instruction|distance
                             _, rest = txt.split(':', 1)
                             parts = rest.split('|')
-                            if len(parts) == 4:
-                                current_street, dist, turn, next_street = parts
-                                print("ON {} | IN {} {} onto {}".format(current_street, dist, turn, next_street))
+                            
+                            if len(parts) == 2:
+                                instruction, dist = parts
+                                # Format with line breaks for better readability
+                                timestamp = time.ticks_ms() // 1000
+                                print("\n" + "="*40)
+                                print("[{}s] {}".format(timestamp, instruction))
+                                print("Distance: {}".format(dist))
+                                print("="*40)
                             else:
-                                print("NAV:", txt)
-                        except Exception as pe:
-                            print("NAV parse error:", pe)
-                        return
-                except Exception:
-                    pass
-                # Otherwise just print raw incoming
-                print("Received:", incoming)
+                                print("NAV:", rest)
+                    except Exception as e:
+                        print("Parse error:", e)
 
     def send_coordinate(self, lat, lon):
         """Send current GPS coordinate back to phone"""
