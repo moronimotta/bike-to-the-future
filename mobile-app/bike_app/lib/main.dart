@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
@@ -8,8 +9,18 @@ import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
 import 'package:google_places_flutter/google_places_flutter.dart';
 import 'package:google_places_flutter/model/prediction.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  try {
+    await dotenv.load(fileName: "assets/.env");
+    print('✅ Environment variables loaded successfully');
+  } catch (e) {
+    print('⚠️ Failed to load environment variables: $e');
+  }
+
   runApp(const MyApp());
 }
 
@@ -44,16 +55,41 @@ class _HomePageState extends State<HomePage> {
   bool _isScanning = false;
   String _status = 'idle';
   final TextEditingController _destinationCtrl = TextEditingController();
+  List<String> _routePoints = [];
+
+  // Environment variables
+  String _googleApiKey = '';
+  String _routeApiUrl = '';
 
   static const String _nusbService = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
   static const String _nusbTx = '6E400003-B5A3-F393-E0A9-E50E24DCCA9E';
   static const String _nusbRx = '6E400002-B5A3-F393-E0A9-E50E24DCCA9E';
 
-  static const String _routeApiUrl =
-      'https://google-maps-route-api.onrender.com/routes';
+  @override
+  void initState() {
+    super.initState();
+    _loadEnvironmentVariables();
+  }
 
-  // Replace with your actual Google Maps API key
-  static const kGoogleApiKey = 'AIzaSyBaC0kLKREARMroxBoEU6u5nFzjgoijML4';
+  Future<void> _loadEnvironmentVariables() async {
+    try {
+      setState(() {
+        _googleApiKey = dotenv.env['GOOGLE_API_KEY'] ?? '';
+        _routeApiUrl = dotenv.env['ROUTE_API_URL'] ??
+            'https://google-maps-route-api.onrender.com/route';
+
+        if (_googleApiKey.isEmpty) {
+          _status = 'Warning: GOOGLE_API_KEY not found in environment file';
+        } else {
+          _status = 'Environment variables loaded successfully';
+        }
+      });
+    } catch (e) {
+      setState(() {
+        _status = 'Error loading environment variables: $e';
+      });
+    }
+  }
 
   @override
   void dispose() {
@@ -88,19 +124,16 @@ class _HomePageState extends State<HomePage> {
       _status = 'scanning for Pico...';
     });
 
-    // Start scanning
     await FlutterBluePlus.startScan(timeout: const Duration(seconds: 10));
 
-    // Listen to scan results
     _scanSub = FlutterBluePlus.scanResults.listen((results) {
       for (ScanResult r in results) {
         final advName = r.device.platformName;
         final advLocalName = r.advertisementData.advName;
         final name = advName.isNotEmpty ? advName : advLocalName;
 
-        print('Found device: "$name" (${r.device.remoteId})'); // Debug log
+        print('Found device: "$name" (${r.device.remoteId})');
 
-        // Check if device name matches your Pico (case-insensitive)
         if (name.toLowerCase().contains('pico') ||
             name.contains('28:CD:C1:0C:8B:F3') ||
             r.device.remoteId.str.contains('28:CD:C1:0C:8B:F3')) {
@@ -114,7 +147,6 @@ class _HomePageState extends State<HomePage> {
       }
     });
 
-    // Handle scan completion
     await Future.delayed(const Duration(seconds: 10));
     if (_connectedDevice == null) {
       setState(() {
@@ -140,7 +172,6 @@ class _HomePageState extends State<HomePage> {
     BluetoothCharacteristic? rx;
     BluetoothCharacteristic? tx;
 
-    // Find UART service characteristics
     for (var s in services) {
       if (s.uuid.toString().toUpperCase() == _nusbService.toUpperCase()) {
         for (var c in s.characteristics) {
@@ -151,7 +182,6 @@ class _HomePageState extends State<HomePage> {
       }
     }
 
-    // Fallback: search by partial UUID
     if (rx == null || tx == null) {
       for (var s in services) {
         for (var c in s.characteristics) {
@@ -165,7 +195,6 @@ class _HomePageState extends State<HomePage> {
     _rxChar = rx;
     _txChar = tx;
 
-    // Subscribe to TX characteristic for receiving data from Pico
     if (_txChar != null) {
       await _txChar!.setNotifyValue(true);
       _txChar!.lastValueStream.listen((data) {
@@ -200,8 +229,6 @@ class _HomePageState extends State<HomePage> {
         desiredAccuracy: LocationAccuracy.high);
   }
 
-  // This method is called when destination field is tapped
-  // The actual autocomplete is handled inline in the TextField widget
   Future<void> _handlePlaceSelection(Prediction prediction) async {
     setState(() {
       _destinationCtrl.text = prediction.description ?? '';
@@ -229,18 +256,25 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
-    setState(() => _status = 'Requesting route from server...');
     final body = json.encode({
-      'Origin': {'lat': pos.latitude, 'lng': pos.longitude},
-      'Destination': dest,
+      'origin': {'lat': pos.latitude, 'lng': pos.longitude},
+      'destination': dest,
     });
 
     http.Response resp;
     try {
+      setState(() => _status = 'Connecting to route server...');
       resp = await http
           .post(Uri.parse(_routeApiUrl),
               headers: {'Content-Type': 'application/json'}, body: body)
           .timeout(const Duration(seconds: 20));
+    } on SocketException catch (e) {
+      setState(() => _status =
+          'Network error: Cannot reach route server. Check internet connection.\nDetails: ${e.message}');
+      return;
+    } on TimeoutException catch (_) {
+      setState(() => _status = 'Route request timed out. Server may be down.');
+      return;
     } catch (e) {
       setState(() => _status = 'Route request failed: $e');
       return;
@@ -253,7 +287,7 @@ class _HomePageState extends State<HomePage> {
     }
 
     final decoded = json.decode(resp.body);
-    final routes = decoded['Routes'] ?? decoded['routes'] ?? [];
+    final routes = decoded['routes'] ?? [];
     if (routes.isEmpty) {
       setState(() => _status = 'No routes returned from server');
       return;
@@ -261,31 +295,73 @@ class _HomePageState extends State<HomePage> {
 
     final firstRoute = routes[0];
     final points = firstRoute['points'] as List<dynamic>;
-    final buffer = StringBuffer();
-    for (var p in points) {
-      final lat = p['lat'];
-      final lng = p['lng'];
-      final desc = p['description'] ?? '';
-      buffer.writeln('$lat,$lng,$desc');
-    }
 
+    // Update UI to display route
+    setState(() {
+      _routePoints = points.map((p) {
+        final lat = p['lat'];
+        final lng = p['lng'];
+        final desc = p['description'] ?? '';
+        return '$lat, $lng ${desc.isNotEmpty ? "- $desc" : ""}';
+      }).toList();
+    });
+
+    // Send route to Pico as JSON
     setState(() => _status = 'Sending ${points.length} waypoints to Pico...');
-    final payload = utf8.encode(buffer.toString());
+
+    // Format the data as JSON matching Pico's expected structure
+    final jsonData = json.encode({
+      'routes': [
+        {
+          'points': points
+              .map((p) => {
+                    'lat': p['lat'],
+                    'lng': p['lng'],
+                    'description': p['description'] ?? '',
+                    'is_down_hill': false,
+                  })
+              .toList()
+        }
+      ]
+    });
+
+    final payload = utf8.encode(jsonData);
+    print('📤 Total JSON payload size: ${payload.length} bytes');
 
     try {
-      const chunkSize = 150;
+      // Use smaller chunk size to match actual BLE transfer capacity
+      const chunkSize = 20; // Match the observed chunk size from Pico
+      int totalChunks = (payload.length / chunkSize).ceil();
+
+      setState(() => _status = 'Sending ${totalChunks} chunks to Pico...');
+
       for (var offset = 0; offset < payload.length; offset += chunkSize) {
         final end = (offset + chunkSize < payload.length)
             ? offset + chunkSize
             : payload.length;
         final chunk = payload.sublist(offset, end);
-        await _rxChar!.write(chunk, withoutResponse: true);
-        await Future.delayed(const Duration(milliseconds: 60));
+
+        int chunkNumber = (offset / chunkSize).floor() + 1;
+        print(
+            '📤 Sending chunk $chunkNumber/$totalChunks (${chunk.length} bytes)');
+
+        // Use withoutResponse: false because Pico UART requires write with response
+        await _rxChar!.write(chunk, withoutResponse: false);
+
+        // Update status with progress
+        setState(() => _status = 'Sending chunk $chunkNumber/$totalChunks...');
+
+        // Longer delay between chunks to ensure Pico can process
+        await Future.delayed(const Duration(milliseconds: 150));
       }
-      setState(() =>
-          _status = 'Route sent! ${points.length} waypoints transferred.');
+
+      setState(() => _status =
+          'Route sent! ${points.length} waypoints in ${totalChunks} chunks.');
+
+      print('✅ All chunks sent successfully');
     } catch (e) {
       setState(() => _status = 'Send failed: $e');
+      print('❌ Send error: $e');
     }
   }
 
@@ -313,6 +389,7 @@ class _HomePageState extends State<HomePage> {
                           _rxChar = null;
                           _txChar = null;
                           _status = 'Disconnected';
+                          _routePoints = [];
                         });
                       }
                     : null,
@@ -349,7 +426,7 @@ class _HomePageState extends State<HomePage> {
                   const SizedBox(height: 8),
                   GooglePlaceAutoCompleteTextField(
                     textEditingController: _destinationCtrl,
-                    googleAPIKey: kGoogleApiKey,
+                    googleAPIKey: _googleApiKey,
                     inputDecoration: const InputDecoration(
                       hintText: 'Search for a place',
                       border: OutlineInputBorder(),
@@ -402,6 +479,23 @@ class _HomePageState extends State<HomePage> {
               ),
             ),
           ),
+          const SizedBox(height: 8),
+          if (_routePoints.isNotEmpty)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(12.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('Route Points',
+                        style: TextStyle(
+                            fontSize: 16, fontWeight: FontWeight.bold)),
+                    const SizedBox(height: 8),
+                    ..._routePoints.map((p) => Text(p)).toList(),
+                  ],
+                ),
+              ),
+            ),
           const SizedBox(height: 8),
           Card(
             child: Padding(
