@@ -5,8 +5,10 @@
 import FlutterMacOS
 import Foundation
 
-import reactive_ble_mobile
+import flutter_blue_plus
+import geolocator_apple
 
 func RegisterGeneratedPlugins(registry: FlutterPluginRegistry) {
-  ReactiveBlePlugin.register(with: registry.registrar(forPlugin: "ReactiveBlePlugin"))
+  FlutterBluePlusPlugin.register(with: registry.registrar(forPlugin: "FlutterBluePlusPlugin"))
+  GeolocatorPlugin.register(with: registry.registrar(forPlugin: "GeolocatorPlugin"))
 }
